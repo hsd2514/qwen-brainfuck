@@ -1,0 +1,2741 @@
+"""Kaggle: BF-Ladder eval - base Qwen vs v7.1 vs v8 final on our own frozen test.
+
+100 problems, 10 skill levels, 5 test cases each, graded with a strict interpreter
+(pointer below 0 is an error; every test must pass). Levels 1-6 cover what training
+taught; levels 7-10 (if/else, count/filter, multi-digit numbers, comparisons) were
+never trained. Every problem ships with a verified reference solution.
+
+The test file is frozen: never train on it, never edit it after scoring.
+Greedy decoding; for trained models only the code after CODE is graded, for the
+base model the whole answer minus any ``` fences.
+
+Setup: GPU T4 (one is used), Internet on, secret HF_TOKEN. About 30-45 min.
+"""
+!pip install -q --no-deps git+https://github.com/hsd2514/bf-gym.git
+!pip install -q -U transformers peft accelerate
+!pip uninstall -y -q torchao
+
+import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+os.environ["TRANSFORMERS_VERBOSITY"] = "error"
+
+import collections
+import json
+import re
+import time
+
+import matplotlib.pyplot as plt
+import torch
+from huggingface_hub import login
+from IPython.display import clear_output
+from kaggle_secrets import UserSecretsClient
+from peft import PeftModel
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+from bf_gym.config import BFConfig
+from bf_gym.interpreter import run_bf
+
+login(token=UserSecretsClient().get_secret("HF_TOKEN"))
+
+LADDER = json.loads(r'''{
+ "name": "bf-ladder",
+ "version": 1,
+ "tests_per_problem": 5,
+ "prompt": "Write a Brainfuck program that does the following.\n\n{description}",
+ "problems": [
+  {
+   "id": "L01-01",
+   "level": 1,
+   "level_name": "print a character",
+   "description": "Print the single character 'Q' and nothing else.",
+   "tests": [
+    [
+     "",
+     "Q"
+    ]
+   ],
+   "reference": "+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++.[-]"
+  },
+  {
+   "id": "L01-02",
+   "level": 1,
+   "level_name": "print a character",
+   "description": "Print the single character '#' and nothing else.",
+   "tests": [
+    [
+     "",
+     "#"
+    ]
+   ],
+   "reference": "+++++++++++++++++++++++++++++++++++.[-]"
+  },
+  {
+   "id": "L01-03",
+   "level": 1,
+   "level_name": "print a character",
+   "description": "Print the single character 'w' and nothing else.",
+   "tests": [
+    [
+     "",
+     "w"
+    ]
+   ],
+   "reference": "+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++.[-]"
+  },
+  {
+   "id": "L01-04",
+   "level": 1,
+   "level_name": "print a character",
+   "description": "Print the single character '7' and nothing else.",
+   "tests": [
+    [
+     "",
+     "7"
+    ]
+   ],
+   "reference": "+++++++++++++++++++++++++++++++++++++++++++++++++++++++.[-]"
+  },
+  {
+   "id": "L01-05",
+   "level": 1,
+   "level_name": "print a character",
+   "description": "Print the single character '~' and nothing else.",
+   "tests": [
+    [
+     "",
+     "~"
+    ]
+   ],
+   "reference": "++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++.[-]"
+  },
+  {
+   "id": "L01-06",
+   "level": 1,
+   "level_name": "print a character",
+   "description": "Print the single character 'V' and nothing else.",
+   "tests": [
+    [
+     "",
+     "V"
+    ]
+   ],
+   "reference": "++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++.[-]"
+  },
+  {
+   "id": "L01-07",
+   "level": 1,
+   "level_name": "print a character",
+   "description": "Print the single character 'j' and nothing else.",
+   "tests": [
+    [
+     "",
+     "j"
+    ]
+   ],
+   "reference": "++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++.[-]"
+  },
+  {
+   "id": "L01-08",
+   "level": 1,
+   "level_name": "print a character",
+   "description": "Print the single character '%' and nothing else.",
+   "tests": [
+    [
+     "",
+     "%"
+    ]
+   ],
+   "reference": "+++++++++++++++++++++++++++++++++++++.[-]"
+  },
+  {
+   "id": "L01-09",
+   "level": 1,
+   "level_name": "print a character",
+   "description": "Print the single character 'K' and nothing else.",
+   "tests": [
+    [
+     "",
+     "K"
+    ]
+   ],
+   "reference": "+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++.[-]"
+  },
+  {
+   "id": "L01-10",
+   "level": 1,
+   "level_name": "print a character",
+   "description": "Print the single character 'z' and nothing else.",
+   "tests": [
+    [
+     "",
+     "z"
+    ]
+   ],
+   "reference": "++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++.[-]"
+  },
+  {
+   "id": "L02-01",
+   "level": 2,
+   "level_name": "print text",
+   "description": "Print exactly 'moon lamp' with no trailing newline.",
+   "tests": [
+    [
+     "",
+     "moon lamp"
+    ]
+   ],
+   "reference": "+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++.++..-.------------------------------------------------------------------------------.++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++.-----------.++++++++++++.+++.[-]"
+  },
+  {
+   "id": "L02-02",
+   "level": 2,
+   "level_name": "print text",
+   "description": "Print exactly 'Go!' with no trailing newline.",
+   "tests": [
+    [
+     "",
+     "Go!"
+    ]
+   ],
+   "reference": "+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++.++++++++++++++++++++++++++++++++++++++++.------------------------------------------------------------------------------.[-]"
+  },
+  {
+   "id": "L02-03",
+   "level": 2,
+   "level_name": "print text",
+   "description": "Print exactly 'rusty key' with no trailing newline.",
+   "tests": [
+    [
+     "",
+     "rusty key"
+    ]
+   ],
+   "reference": "++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++.+++.--.+.+++++.-----------------------------------------------------------------------------------------.+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++.------.++++++++++++++++++++.[-]"
+  },
+  {
+   "id": "L02-04",
+   "level": 2,
+   "level_name": "print text",
+   "description": "Print exactly '7 up' with no trailing newline.",
+   "tests": [
+    [
+     "",
+     "7 up"
+    ]
+   ],
+   "reference": "+++++++++++++++++++++++++++++++++++++++++++++++++++++++.-----------------------.+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++.-----.[-]"
+  },
+  {
+   "id": "L02-05",
+   "level": 2,
+   "level_name": "print text",
+   "description": "Print exactly 'Blue Fox' with no trailing newline.",
+   "tests": [
+    [
+     "",
+     "Blue Fox"
+    ]
+   ],
+   "reference": "++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++.++++++++++++++++++++++++++++++++++++++++++.+++++++++.----------------.---------------------------------------------------------------------.++++++++++++++++++++++++++++++++++++++.+++++++++++++++++++++++++++++++++++++++++.+++++++++.[-]"
+  },
+  {
+   "id": "L02-06",
+   "level": 2,
+   "level_name": "print text",
+   "description": "Print exactly 'ping?' with no trailing newline.",
+   "tests": [
+    [
+     "",
+     "ping?"
+    ]
+   ],
+   "reference": "++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++.-------.+++++.-------.----------------------------------------.[-]"
+  },
+  {
+   "id": "L02-07",
+   "level": 2,
+   "level_name": "print text",
+   "description": "Print exactly 'ok ok' with no trailing newline.",
+   "tests": [
+    [
+     "",
+     "ok ok"
+    ]
+   ],
+   "reference": "+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++.----.---------------------------------------------------------------------------.+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++.----.[-]"
+  },
+  {
+   "id": "L02-08",
+   "level": 2,
+   "level_name": "print text",
+   "description": "Print exactly 'Zed 42' with no trailing newline.",
+   "tests": [
+    [
+     "",
+     "Zed 42"
+    ]
+   ],
+   "reference": "++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++.+++++++++++.-.--------------------------------------------------------------------.++++++++++++++++++++.--.[-]"
+  },
+  {
+   "id": "L02-09",
+   "level": 2,
+   "level_name": "print text",
+   "description": "Print exactly 'wave' with no trailing newline.",
+   "tests": [
+    [
+     "",
+     "wave"
+    ]
+   ],
+   "reference": "+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++.----------------------.+++++++++++++++++++++.-----------------.[-]"
+  },
+  {
+   "id": "L02-10",
+   "level": 2,
+   "level_name": "print text",
+   "description": "Print exactly 'night owl' with no trailing newline.",
+   "tests": [
+    [
+     "",
+     "night owl"
+    ]
+   ],
+   "reference": "++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++.-----.--.+.++++++++++++.------------------------------------------------------------------------------------.+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++.++++++++.-----------.[-]"
+  },
+  {
+   "id": "L03-01",
+   "level": 3,
+   "level_name": "one character in",
+   "description": "Read one lowercase letter and print the letter 6 places later in the alphabet.",
+   "tests": [
+    [
+     "q",
+     "w"
+    ],
+    [
+     "p",
+     "v"
+    ],
+    [
+     "r",
+     "x"
+    ],
+    [
+     "h",
+     "n"
+    ],
+    [
+     "j",
+     "p"
+    ]
+   ],
+   "reference": ",++++++."
+  },
+  {
+   "id": "L03-02",
+   "level": 3,
+   "level_name": "one character in",
+   "description": "Read one lowercase letter and print the letter 7 places later in the alphabet.",
+   "tests": [
+    [
+     "j",
+     "q"
+    ],
+    [
+     "s",
+     "z"
+    ],
+    [
+     "h",
+     "o"
+    ],
+    [
+     "i",
+     "p"
+    ],
+    [
+     "m",
+     "t"
+    ]
+   ],
+   "reference": ",+++++++."
+  },
+  {
+   "id": "L03-03",
+   "level": 3,
+   "level_name": "one character in",
+   "description": "Read one lowercase letter and print the letter 6 places earlier in the alphabet.",
+   "tests": [
+    [
+     "j",
+     "d"
+    ],
+    [
+     "i",
+     "c"
+    ],
+    [
+     "m",
+     "g"
+    ],
+    [
+     "o",
+     "i"
+    ],
+    [
+     "r",
+     "l"
+    ]
+   ],
+   "reference": ",------."
+  },
+  {
+   "id": "L03-04",
+   "level": 3,
+   "level_name": "one character in",
+   "description": "Read one character and print it three times.",
+   "tests": [
+    [
+     "k",
+     "kkk"
+    ],
+    [
+     "i",
+     "iii"
+    ],
+    [
+     "q",
+     "qqq"
+    ],
+    [
+     "l",
+     "lll"
+    ],
+    [
+     "o",
+     "ooo"
+    ]
+   ],
+   "reference": ",..."
+  },
+  {
+   "id": "L03-05",
+   "level": 3,
+   "level_name": "one character in",
+   "description": "Read one character and print it followed by an exclamation mark.",
+   "tests": [
+    [
+     "q",
+     "q!"
+    ],
+    [
+     "i",
+     "i!"
+    ],
+    [
+     "s",
+     "s!"
+    ],
+    [
+     "r",
+     "r!"
+    ],
+    [
+     "p",
+     "p!"
+    ]
+   ],
+   "reference": ",.>+++++++++++++++++++++++++++++++++.[-]<"
+  },
+  {
+   "id": "L03-06",
+   "level": 3,
+   "level_name": "one character in",
+   "description": "Read one lowercase letter and print it in uppercase followed by a newline.",
+   "tests": [
+    [
+     "r",
+     "R\n"
+    ],
+    [
+     "s",
+     "S\n"
+    ],
+    [
+     "h",
+     "H\n"
+    ],
+    [
+     "q",
+     "Q\n"
+    ],
+    [
+     "o",
+     "O\n"
+    ]
+   ],
+   "reference": ",-------------------------------->++++++++++<.>."
+  },
+  {
+   "id": "L03-07",
+   "level": 3,
+   "level_name": "one character in",
+   "description": "Read one character and print it twice with a space between.",
+   "tests": [
+    [
+     "r",
+     "r r"
+    ],
+    [
+     "o",
+     "o o"
+    ],
+    [
+     "p",
+     "p p"
+    ],
+    [
+     "s",
+     "s s"
+    ],
+    [
+     "q",
+     "q q"
+    ]
+   ],
+   "reference": ",.>++++++++++++++++++++++++++++++++.<."
+  },
+  {
+   "id": "L03-08",
+   "level": 3,
+   "level_name": "one character in",
+   "description": "Read one lowercase letter and print the letter just before it in the alphabet.",
+   "tests": [
+    [
+     "p",
+     "o"
+    ],
+    [
+     "g",
+     "f"
+    ],
+    [
+     "j",
+     "i"
+    ],
+    [
+     "k",
+     "j"
+    ],
+    [
+     "s",
+     "r"
+    ]
+   ],
+   "reference": ",-."
+  },
+  {
+   "id": "L03-09",
+   "level": 3,
+   "level_name": "one character in",
+   "description": "Read one uppercase letter and print it in lowercase.",
+   "tests": [
+    [
+     "O",
+     "o"
+    ],
+    [
+     "L",
+     "l"
+    ],
+    [
+     "H",
+     "h"
+    ],
+    [
+     "G",
+     "g"
+    ],
+    [
+     "P",
+     "p"
+    ]
+   ],
+   "reference": ",++++++++++++++++++++++++++++++++."
+  },
+  {
+   "id": "L03-10",
+   "level": 3,
+   "level_name": "one character in",
+   "description": "Read one lowercase letter and print the letter 2 places later, then the letter itself.",
+   "tests": [
+    [
+     "h",
+     "jh"
+    ],
+    [
+     "j",
+     "lj"
+    ],
+    [
+     "i",
+     "ki"
+    ],
+    [
+     "n",
+     "pn"
+    ],
+    [
+     "o",
+     "qo"
+    ]
+   ],
+   "reference": ",++.--."
+  },
+  {
+   "id": "L04-01",
+   "level": 4,
+   "level_name": "loop over input",
+   "description": "Read the whole input and print every character three times.",
+   "tests": [
+    [
+     "m",
+     "mmm"
+    ],
+    [
+     "g",
+     "ggg"
+    ],
+    [
+     "",
+     ""
+    ],
+    [
+     "ai",
+     "aaaiii"
+    ],
+    [
+     "iab",
+     "iiiaaabbb"
+    ]
+   ],
+   "reference": ",[...,]"
+  },
+  {
+   "id": "L04-02",
+   "level": 4,
+   "level_name": "loop over input",
+   "description": "Read the whole input and print every character with its byte value increased by 5.",
+   "tests": [
+    [
+     "",
+     ""
+    ],
+    [
+     "pijflf",
+     "unokqk"
+    ],
+    [
+     "o",
+     "t"
+    ],
+    [
+     "offphj",
+     "tkkumo"
+    ],
+    [
+     "jplikm",
+     "ouqnpr"
+    ]
+   ],
+   "reference": ",[+++++.,]"
+  },
+  {
+   "id": "L04-03",
+   "level": 4,
+   "level_name": "loop over input",
+   "description": "Read the whole input and print every character with its byte value decreased by 4.",
+   "tests": [
+    [
+     "hgoll",
+     "dckhh"
+    ],
+    [
+     "hj",
+     "df"
+    ],
+    [
+     "qqpj",
+     "mmlf"
+    ],
+    [
+     "mpm",
+     "ili"
+    ],
+    [
+     "ogiif",
+     "kceeb"
+    ]
+   ],
+   "reference": ",[----.,]"
+  },
+  {
+   "id": "L04-04",
+   "level": 4,
+   "level_name": "loop over input",
+   "description": "Read the whole input and print each character followed by '+'.",
+   "tests": [
+    [
+     "f",
+     "f+"
+    ],
+    [
+     "lsaw",
+     "l+s+a+w+"
+    ],
+    [
+     "aor",
+     "a+o+r+"
+    ],
+    [
+     "",
+     ""
+    ],
+    [
+     "mcxnm",
+     "m+c+x+n+m+"
+    ]
+   ],
+   "reference": ">+++++++++++++++++++++++++++++++++++++++++++<,[.>.<,]"
+  },
+  {
+   "id": "L04-05",
+   "level": 4,
+   "level_name": "loop over input",
+   "description": "Read the whole input and print each character followed by '='.",
+   "tests": [
+    [
+     "",
+     ""
+    ],
+    [
+     "tcsx",
+     "t=c=s=x="
+    ],
+    [
+     "z",
+     "z="
+    ],
+    [
+     "cvvhv",
+     "c=v=v=h=v="
+    ],
+    [
+     "bftts",
+     "b=f=t=t=s="
+    ]
+   ],
+   "reference": ">+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++<,[.>.<,]"
+  },
+  {
+   "id": "L04-06",
+   "level": 4,
+   "level_name": "loop over input",
+   "description": "Read the whole input (lowercase letters) and print each character in uppercase followed by '.'.",
+   "tests": [
+    [
+     "hk",
+     "H.K."
+    ],
+    [
+     "gxw",
+     "G.X.W."
+    ],
+    [
+     "usvpcg",
+     "U.S.V.P.C.G."
+    ],
+    [
+     "",
+     ""
+    ],
+    [
+     "b",
+     "B."
+    ]
+   ],
+   "reference": ">++++++++++++++++++++++++++++++++++++++++++++++<,[--------------------------------.>.<,]"
+  },
+  {
+   "id": "L04-07",
+   "level": 4,
+   "level_name": "loop over input",
+   "description": "Read the whole input, print every character twice, then print a newline.",
+   "tests": [
+    [
+     "usg",
+     "uussgg\n"
+    ],
+    [
+     "woe",
+     "wwooee\n"
+    ],
+    [
+     "",
+     "\n"
+    ],
+    [
+     "ddt",
+     "ddddtt\n"
+    ],
+    [
+     "kfce",
+     "kkffccee\n"
+    ]
+   ],
+   "reference": ",[..,]++++++++++."
+  },
+  {
+   "id": "L04-08",
+   "level": 4,
+   "level_name": "loop over input",
+   "description": "Read the whole input, print it unchanged, then print '#'.",
+   "tests": [
+    [
+     "",
+     "#"
+    ],
+    [
+     "ghswr",
+     "ghswr#"
+    ],
+    [
+     "mgcbuu",
+     "mgcbuu#"
+    ],
+    [
+     "q",
+     "q#"
+    ],
+    [
+     "mjfzk",
+     "mjfzk#"
+    ]
+   ],
+   "reference": ",[.,]+++++++++++++++++++++++++++++++++++."
+  },
+  {
+   "id": "L04-09",
+   "level": 4,
+   "level_name": "loop over input",
+   "description": "Read the whole input (uppercase letters) and print each character in lowercase followed by a space.",
+   "tests": [
+    [
+     "",
+     ""
+    ],
+    [
+     "ZVJ",
+     "z v j "
+    ],
+    [
+     "MN",
+     "m n "
+    ],
+    [
+     "TCDB",
+     "t c d b "
+    ],
+    [
+     "EC",
+     "e c "
+    ]
+   ],
+   "reference": ">++++++++++++++++++++++++++++++++<,[++++++++++++++++++++++++++++++++.>.<,]"
+  },
+  {
+   "id": "L04-10",
+   "level": 4,
+   "level_name": "loop over input",
+   "description": "Read the whole input and print every character with its byte value increased by 1, twice.",
+   "tests": [
+    [
+     "poplfq",
+     "qqppqqmmggrr"
+    ],
+    [
+     "fp",
+     "ggqq"
+    ],
+    [
+     "hgk",
+     "iihhll"
+    ],
+    [
+     "qohm",
+     "rrppiinn"
+    ],
+    [
+     "hjf",
+     "iikkgg"
+    ]
+   ],
+   "reference": ",[+..,]"
+  },
+  {
+   "id": "L05-01",
+   "level": 5,
+   "level_name": "several cells",
+   "description": "Read the whole input and print it followed by its reverse.",
+   "tests": [
+    [
+     "slk",
+     "slkkls"
+    ],
+    [
+     "iryban",
+     "irybannabyri"
+    ],
+    [
+     "eg",
+     "egge"
+    ],
+    [
+     "h",
+     "hh"
+    ],
+    [
+     "ddls",
+     "ddlssldd"
+    ]
+   ],
+   "reference": ">,[.>,]<[.<]"
+  },
+  {
+   "id": "L05-02",
+   "level": 5,
+   "level_name": "several cells",
+   "description": "Read the whole input and print it reversed, then '!'.",
+   "tests": [
+    [
+     "a",
+     "a!"
+    ],
+    [
+     "xyxdo",
+     "odxyx!"
+    ],
+    [
+     "p",
+     "p!"
+    ],
+    [
+     "wyjyeo",
+     "oeyjyw!"
+    ],
+    [
+     "bdaljb",
+     "bjladb!"
+    ]
+   ],
+   "reference": ">,[>,]<[.<]+++++++++++++++++++++++++++++++++."
+  },
+  {
+   "id": "L05-03",
+   "level": 5,
+   "level_name": "several cells",
+   "description": "Read the whole input and print it reversed with every byte value increased by 2.",
+   "tests": [
+    [
+     "mkclz",
+     "|nemo"
+    ],
+    [
+     "lfif",
+     "hkhn"
+    ],
+    [
+     "sul",
+     "nwu"
+    ],
+    [
+     "lh",
+     "jn"
+    ],
+    [
+     "jh",
+     "jl"
+    ]
+   ],
+   "reference": ">,[++>,]<[.<]"
+  },
+  {
+   "id": "L05-04",
+   "level": 5,
+   "level_name": "several cells",
+   "description": "Read the whole input, print it unchanged, then print its length as one digit.",
+   "tests": [
+    [
+     "hhod",
+     "hhod4"
+    ],
+    [
+     "afqtg",
+     "afqtg5"
+    ],
+    [
+     "byu",
+     "byu3"
+    ],
+    [
+     "idvs",
+     "idvs4"
+    ],
+    [
+     "swg",
+     "swg3"
+    ]
+   ],
+   "reference": ",[.>+<,]>++++++++++++++++++++++++++++++++++++++++++++++++."
+  },
+  {
+   "id": "L05-05",
+   "level": 5,
+   "level_name": "several cells",
+   "description": "Read the whole input and print it reversed with every character doubled.",
+   "tests": [
+    [
+     "yq",
+     "qqyy"
+    ],
+    [
+     "h",
+     "hh"
+    ],
+    [
+     "vkn",
+     "nnkkvv"
+    ],
+    [
+     "zeyy",
+     "yyyyeezz"
+    ],
+    [
+     "ngfsc",
+     "ccssffggnn"
+    ]
+   ],
+   "reference": ">,[>,]<[..<]"
+  },
+  {
+   "id": "L05-06",
+   "level": 5,
+   "level_name": "several cells",
+   "description": "Read the whole input and print its last character followed by its first character.",
+   "tests": [
+    [
+     "tbk",
+     "kt"
+    ],
+    [
+     "oy",
+     "yo"
+    ],
+    [
+     "iy",
+     "yi"
+    ],
+    [
+     "epphh",
+     "he"
+    ],
+    [
+     "idgmlv",
+     "vi"
+    ]
+   ],
+   "reference": ">,[>,]<.[<]>."
+  },
+  {
+   "id": "L05-07",
+   "level": 5,
+   "level_name": "several cells",
+   "description": "Read the whole input (lowercase letters) and print it reversed in uppercase.",
+   "tests": [
+    [
+     "a",
+     "A"
+    ],
+    [
+     "al",
+     "LA"
+    ],
+    [
+     "wuntbx",
+     "XBTNUW"
+    ],
+    [
+     "qlfkn",
+     "NKFLQ"
+    ],
+    [
+     "b",
+     "B"
+    ]
+   ],
+   "reference": ">,[-------------------------------->,]<[.<]"
+  },
+  {
+   "id": "L05-08",
+   "level": 5,
+   "level_name": "several cells",
+   "description": "Read the whole input and print one '*' per character, then a newline.",
+   "tests": [
+    [
+     "aaxkb",
+     "*****\n"
+    ],
+    [
+     "sde",
+     "***\n"
+    ],
+    [
+     "ld",
+     "**\n"
+    ],
+    [
+     "trra",
+     "****\n"
+    ],
+    [
+     "d",
+     "*\n"
+    ]
+   ],
+   "reference": ",[>+<,]>>++++++++++++++++++++++++++++++++++++++++++<[>.<-]>>++++++++++."
+  },
+  {
+   "id": "L05-09",
+   "level": 5,
+   "level_name": "several cells",
+   "description": "Read the whole input and print its first character, then the whole input reversed.",
+   "tests": [
+    [
+     "csbqi",
+     "ciqbsc"
+    ],
+    [
+     "tfvabp",
+     "tpbavft"
+    ],
+    [
+     "joekcd",
+     "jdckeoj"
+    ],
+    [
+     "cu",
+     "cuc"
+    ],
+    [
+     "mhp",
+     "mphm"
+    ]
+   ],
+   "reference": ">,.[>,]<[.<]"
+  },
+  {
+   "id": "L05-10",
+   "level": 5,
+   "level_name": "several cells",
+   "description": "Read the whole input, print it reversed, then a newline, then the input unchanged.",
+   "tests": [
+    [
+     "tra",
+     "art\ntra"
+    ],
+    [
+     "ger",
+     "reg\nger"
+    ],
+    [
+     "gksp",
+     "pskg\ngksp"
+    ],
+    [
+     "i",
+     "i\ni"
+    ],
+    [
+     "bh",
+     "hb\nbh"
+    ]
+   ],
+   "reference": ">,[>,]<[.<]++++++++++.>[.>]"
+  },
+  {
+   "id": "L06-01",
+   "level": 6,
+   "level_name": "digit math",
+   "description": "Read two digits separated by a space and print the first minus the second. The first is never smaller.",
+   "tests": [
+    [
+     "7 5",
+     "2"
+    ],
+    [
+     "5 1",
+     "4"
+    ],
+    [
+     "9 6",
+     "3"
+    ],
+    [
+     "4 0",
+     "4"
+    ],
+    [
+     "2 2",
+     "0"
+    ]
+   ],
+   "reference": ",>,>,[-<<->>]<<++++++++++++++++++++++++++++++++++++++++++++++++."
+  },
+  {
+   "id": "L06-02",
+   "level": 6,
+   "level_name": "digit math",
+   "description": "Read one digit and print that number plus 5. The result is at most 9.",
+   "tests": [
+    [
+     "2",
+     "7"
+    ],
+    [
+     "0",
+     "5"
+    ],
+    [
+     "1",
+     "6"
+    ],
+    [
+     "4",
+     "9"
+    ],
+    [
+     "3",
+     "8"
+    ]
+   ],
+   "reference": ",+++++."
+  },
+  {
+   "id": "L06-03",
+   "level": 6,
+   "level_name": "digit math",
+   "description": "Read one digit and print three times its value. The result is at most 9.",
+   "tests": [
+    [
+     "1",
+     "3"
+    ],
+    [
+     "2",
+     "6"
+    ],
+    [
+     "3",
+     "9"
+    ],
+    [
+     "0",
+     "0"
+    ],
+    [
+     "1",
+     "3"
+    ]
+   ],
+   "reference": ",------------------------------------------------[>+++<-]>++++++++++++++++++++++++++++++++++++++++++++++++."
+  },
+  {
+   "id": "L06-04",
+   "level": 6,
+   "level_name": "digit math",
+   "description": "Read three digits separated by spaces and print their sum. The sum is at most 9.",
+   "tests": [
+    [
+     "1 5 2",
+     "8"
+    ],
+    [
+     "2 3 1",
+     "6"
+    ],
+    [
+     "5 0 1",
+     "6"
+    ],
+    [
+     "2 1 5",
+     "8"
+    ],
+    [
+     "1 2 5",
+     "8"
+    ]
+   ],
+   "reference": ",>,>,>,>,[-<<<<+>>>>]<<[-<<+>>]<<------------------------------------------------------------------------------------------------."
+  },
+  {
+   "id": "L06-05",
+   "level": 6,
+   "level_name": "digit math",
+   "description": "Read one digit and print that number minus 4. The digit is at least 4.",
+   "tests": [
+    [
+     "7",
+     "3"
+    ],
+    [
+     "8",
+     "4"
+    ],
+    [
+     "9",
+     "5"
+    ],
+    [
+     "5",
+     "1"
+    ],
+    [
+     "4",
+     "0"
+    ]
+   ],
+   "reference": ",----."
+  },
+  {
+   "id": "L06-06",
+   "level": 6,
+   "level_name": "digit math",
+   "description": "Read one digit n and print 9 minus n.",
+   "tests": [
+    [
+     "3",
+     "6"
+    ],
+    [
+     "2",
+     "7"
+    ],
+    [
+     "0",
+     "9"
+    ],
+    [
+     "9",
+     "0"
+    ],
+    [
+     "7",
+     "2"
+    ]
+   ],
+   "reference": ",------------------------------------------------>+++++++++++++++++++++++++++++++++++++++++++++++++++++++++<[->-<]>."
+  },
+  {
+   "id": "L06-07",
+   "level": 6,
+   "level_name": "digit math",
+   "description": "Read two digits separated by a space and print their sum. The sum is at most 9.",
+   "tests": [
+    [
+     "7 0",
+     "7"
+    ],
+    [
+     "3 4",
+     "7"
+    ],
+    [
+     "2 2",
+     "4"
+    ],
+    [
+     "7 1",
+     "8"
+    ],
+    [
+     "0 3",
+     "3"
+    ]
+   ],
+   "reference": ",>,>,[-<<+>>]<<------------------------------------------------."
+  },
+  {
+   "id": "L06-08",
+   "level": 6,
+   "level_name": "digit math",
+   "description": "Read one digit n (at most 8) and print n followed by n plus 1.",
+   "tests": [
+    [
+     "1",
+     "12"
+    ],
+    [
+     "8",
+     "89"
+    ],
+    [
+     "2",
+     "23"
+    ],
+    [
+     "3",
+     "34"
+    ],
+    [
+     "6",
+     "67"
+    ]
+   ],
+   "reference": ",.+."
+  },
+  {
+   "id": "L06-09",
+   "level": 6,
+   "level_name": "digit math",
+   "description": "Read one digit n (at most 8) and print n plus 1 twice.",
+   "tests": [
+    [
+     "1",
+     "22"
+    ],
+    [
+     "3",
+     "44"
+    ],
+    [
+     "0",
+     "11"
+    ],
+    [
+     "4",
+     "55"
+    ],
+    [
+     "8",
+     "99"
+    ]
+   ],
+   "reference": ",+.."
+  },
+  {
+   "id": "L06-10",
+   "level": 6,
+   "level_name": "digit math",
+   "description": "Read two digits separated by a space and print the first minus the second minus 1. The first is always larger.",
+   "tests": [
+    [
+     "4 1",
+     "2"
+    ],
+    [
+     "6 5",
+     "0"
+    ],
+    [
+     "5 1",
+     "3"
+    ],
+    [
+     "7 0",
+     "6"
+    ],
+    [
+     "7 1",
+     "5"
+    ]
+   ],
+   "reference": ",>,>,[-<<->>]<<+++++++++++++++++++++++++++++++++++++++++++++++."
+  },
+  {
+   "id": "L07-01",
+   "level": 7,
+   "level_name": "if / else",
+   "description": "Read one character. Print 'Y' if it is 'k', otherwise print 'N'.",
+   "tests": [
+    [
+     "k",
+     "Y"
+    ],
+    [
+     "t",
+     "N"
+    ],
+    [
+     "a",
+     "N"
+    ],
+    [
+     "A",
+     "N"
+    ],
+    [
+     "o",
+     "N"
+    ]
+   ],
+   "reference": ",[->+>+<<]>>[-<<+>>]<----------------------------------------------------------------------------------------------------------->>+<<[[-]>>->++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++.[-]<<<]>>[->+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++.[-]<]"
+  },
+  {
+   "id": "L07-02",
+   "level": 7,
+   "level_name": "if / else",
+   "description": "Read one character. Print 'yes' if it is 'm', otherwise print 'no'.",
+   "tests": [
+    [
+     "l",
+     "no"
+    ],
+    [
+     "m",
+     "yes"
+    ],
+    [
+     "r",
+     "no"
+    ],
+    [
+     "x",
+     "no"
+    ],
+    [
+     "a",
+     "no"
+    ]
+   ],
+   "reference": ",[->+>+<<]>>[-<<+>>]<------------------------------------------------------------------------------------------------------------->>+<<[[-]>>->++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++.+.[-]<<<]>>[->+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++.--------------------.++++++++++++++.[-]<]"
+  },
+  {
+   "id": "L07-03",
+   "level": 7,
+   "level_name": "if / else",
+   "description": "Read one character. Print '*' if it is 'p', otherwise print the character itself.",
+   "tests": [
+    [
+     "M",
+     "M"
+    ],
+    [
+     "p",
+     "*"
+    ],
+    [
+     "s",
+     "s"
+    ],
+    [
+     "j",
+     "j"
+    ],
+    [
+     "n",
+     "n"
+    ]
+   ],
+   "reference": ",[->+>+<<]>>[-<<+>>]<---------------------------------------------------------------------------------------------------------------->>+<<[[-]>>-<<<.>]>>[->++++++++++++++++++++++++++++++++++++++++++.[-]<]"
+  },
+  {
+   "id": "L07-04",
+   "level": 7,
+   "level_name": "if / else",
+   "description": "Read one character. Print 'U!' if it is 'u', otherwise print '-'.",
+   "tests": [
+    [
+     "s",
+     "-"
+    ],
+    [
+     "u",
+     "U!"
+    ],
+    [
+     "P",
+     "-"
+    ],
+    [
+     "l",
+     "-"
+    ],
+    [
+     "x",
+     "-"
+    ]
+   ],
+   "reference": ",[->+>+<<]>>[-<<+>>]<--------------------------------------------------------------------------------------------------------------------->>+<<[[-]>>->+++++++++++++++++++++++++++++++++++++++++++++.[-]<<<]>>[->+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++.----------------------------------------------------.[-]<]"
+  },
+  {
+   "id": "L07-05",
+   "level": 7,
+   "level_name": "if / else",
+   "description": "Read one character. Print 'match' if it is 'w', otherwise print 'no'.",
+   "tests": [
+    [
+     "w",
+     "match"
+    ],
+    [
+     "c",
+     "no"
+    ],
+    [
+     "K",
+     "no"
+    ],
+    [
+     "t",
+     "no"
+    ],
+    [
+     "A",
+     "no"
+    ]
+   ],
+   "reference": ",[->+>+<<]>>[-<<+>>]<----------------------------------------------------------------------------------------------------------------------->>+<<[[-]>>->++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++.+.[-]<<<]>>[->+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++.------------.+++++++++++++++++++.-----------------.+++++.[-]<]"
+  },
+  {
+   "id": "L07-06",
+   "level": 7,
+   "level_name": "if / else",
+   "description": "Read one character. Print '1' if it is 'b', otherwise print '0'.",
+   "tests": [
+    [
+     "M",
+     "0"
+    ],
+    [
+     "b",
+     "1"
+    ],
+    [
+     "r",
+     "0"
+    ],
+    [
+     "a",
+     "0"
+    ],
+    [
+     "s",
+     "0"
+    ]
+   ],
+   "reference": ",[->+>+<<]>>[-<<+>>]<-------------------------------------------------------------------------------------------------->>+<<[[-]>>->++++++++++++++++++++++++++++++++++++++++++++++++.[-]<<<]>>[->+++++++++++++++++++++++++++++++++++++++++++++++++.[-]<]"
+  },
+  {
+   "id": "L07-07",
+   "level": 7,
+   "level_name": "if / else",
+   "description": "Read one character. If it is 'd' print it in uppercase, otherwise print '?'.",
+   "tests": [
+    [
+     "d",
+     "D"
+    ],
+    [
+     "K",
+     "?"
+    ],
+    [
+     "b",
+     "?"
+    ],
+    [
+     "z",
+     "?"
+    ],
+    [
+     "M",
+     "?"
+    ]
+   ],
+   "reference": ",[->+>+<<]>>[-<<+>>]<---------------------------------------------------------------------------------------------------->>+<<[[-]>>->+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++.[-]<<<]>>[-<<<--------------------------------.>>>]"
+  },
+  {
+   "id": "L07-08",
+   "level": 7,
+   "level_name": "if / else",
+   "description": "Read one character. Print the character itself if it is 'g', otherwise print '.'.",
+   "tests": [
+    [
+     "g",
+     "g"
+    ],
+    [
+     "y",
+     "."
+    ],
+    [
+     "f",
+     "."
+    ],
+    [
+     "b",
+     "."
+    ],
+    [
+     "t",
+     "."
+    ]
+   ],
+   "reference": ",[->+>+<<]>>[-<<+>>]<------------------------------------------------------------------------------------------------------->>+<<[[-]>>->++++++++++++++++++++++++++++++++++++++++++++++.[-]<<<]>>[-<<<.>>>]"
+  },
+  {
+   "id": "L07-09",
+   "level": 7,
+   "level_name": "if / else",
+   "description": "Read one character. Print 'hit' if it is 'h', otherwise print 'miss'.",
+   "tests": [
+    [
+     "n",
+     "miss"
+    ],
+    [
+     "b",
+     "miss"
+    ],
+    [
+     "i",
+     "miss"
+    ],
+    [
+     "c",
+     "miss"
+    ],
+    [
+     "h",
+     "hit"
+    ]
+   ],
+   "reference": ",[->+>+<<]>>[-<<+>>]<-------------------------------------------------------------------------------------------------------->>+<<[[-]>>->+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++.----.++++++++++..[-]<<<]>>[->++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++.+.+++++++++++.[-]<]"
+  },
+  {
+   "id": "L07-10",
+   "level": 7,
+   "level_name": "if / else",
+   "description": "Read one character. Print 'T' if it is 'v', otherwise print 'F'.",
+   "tests": [
+    [
+     "x",
+     "F"
+    ],
+    [
+     "q",
+     "F"
+    ],
+    [
+     "v",
+     "T"
+    ],
+    [
+     "z",
+     "F"
+    ],
+    [
+     "r",
+     "F"
+    ]
+   ],
+   "reference": ",[->+>+<<]>>[-<<+>>]<---------------------------------------------------------------------------------------------------------------------->>+<<[[-]>>->++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++.[-]<<<]>>[->++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++.[-]<]"
+  },
+  {
+   "id": "L08-01",
+   "level": 8,
+   "level_name": "count and filter",
+   "description": "Read the whole input and print how many times the letter 'k' appears, as one digit.",
+   "tests": [
+    [
+     "wvav",
+     "0"
+    ],
+    [
+     "phdc",
+     "0"
+    ],
+    [
+     "ka",
+     "1"
+    ],
+    [
+     "sgbepcl",
+     "0"
+    ],
+    [
+     "kkdewh",
+     "2"
+    ]
+   ],
+   "reference": ",[[->+>+<<]>>[-<<+>>]<----------------------------------------------------------------------------------------------------------->>+>+<<<[[-]>>-<<]>>[>->+<<-]>[-]<<<<,]>>>>>++++++++++++++++++++++++++++++++++++++++++++++++."
+  },
+  {
+   "id": "L08-02",
+   "level": 8,
+   "level_name": "count and filter",
+   "description": "Read the whole input and print how many times the letter 'm' appears, as one digit.",
+   "tests": [
+    [
+     "mrmcb",
+     "2"
+    ],
+    [
+     "gmhss",
+     "1"
+    ],
+    [
+     "m",
+     "1"
+    ],
+    [
+     "vrrm",
+     "1"
+    ],
+    [
+     "smmhs",
+     "2"
+    ]
+   ],
+   "reference": ",[[->+>+<<]>>[-<<+>>]<------------------------------------------------------------------------------------------------------------->>+>+<<<[[-]>>-<<]>>[>->+<<-]>[-]<<<<,]>>>>>++++++++++++++++++++++++++++++++++++++++++++++++."
+  },
+  {
+   "id": "L08-03",
+   "level": 8,
+   "level_name": "count and filter",
+   "description": "Read the whole input and print it with every 'p' removed.",
+   "tests": [
+    [
+     "plehpm",
+     "lehm"
+    ],
+    [
+     "ppmhp",
+     "mh"
+    ],
+    [
+     "gcp",
+     "gc"
+    ],
+    [
+     "",
+     ""
+    ],
+    [
+     "rc",
+     "rc"
+    ]
+   ],
+   "reference": ",[[->+>+<<]>>[-<<+>>]<---------------------------------------------------------------------------------------------------------------->>+>+<<<[[-]>>-<<]>>[>-<-]>[<<<<.>>>>-]<<<<,]"
+  },
+  {
+   "id": "L08-04",
+   "level": 8,
+   "level_name": "count and filter",
+   "description": "Read the whole input and print it with every 'u' removed.",
+   "tests": [
+    [
+     "tu",
+     "t"
+    ],
+    [
+     "duu",
+     "d"
+    ],
+    [
+     "uaphn",
+     "aphn"
+    ],
+    [
+     "kduknuk",
+     "kdknk"
+    ],
+    [
+     "gu",
+     "g"
+    ]
+   ],
+   "reference": ",[[->+>+<<]>>[-<<+>>]<--------------------------------------------------------------------------------------------------------------------->>+>+<<<[[-]>>-<<]>>[>-<-]>[<<<<.>>>>-]<<<<,]"
+  },
+  {
+   "id": "L08-05",
+   "level": 8,
+   "level_name": "count and filter",
+   "description": "Read the whole input and print it with every 'w' replaced by '*'.",
+   "tests": [
+    [
+     "",
+     ""
+    ],
+    [
+     "sbww",
+     "sb**"
+    ],
+    [
+     "nwpwrt",
+     "n*p*rt"
+    ],
+    [
+     "kcmu",
+     "kcmu"
+    ],
+    [
+     "rvuwp",
+     "rvu*p"
+    ]
+   ],
+   "reference": ",[[->+>+<<]>>[-<<+>>]<----------------------------------------------------------------------------------------------------------------------->>+>+<<<[[-]>>-<<]>>[>->>++++++++++++++++++++++++++++++++++++++++++.[-]<<<-]>[<<<<.>>>>-]<<<<,]"
+  },
+  {
+   "id": "L08-06",
+   "level": 8,
+   "level_name": "count and filter",
+   "description": "Read the whole input and print it with every 'b' replaced by 'B'.",
+   "tests": [
+    [
+     "bl",
+     "Bl"
+    ],
+    [
+     "b",
+     "B"
+    ],
+    [
+     "d",
+     "d"
+    ],
+    [
+     "klthlu",
+     "klthlu"
+    ],
+    [
+     "hnvhhhn",
+     "hnvhhhn"
+    ]
+   ],
+   "reference": ",[[->+>+<<]>>[-<<+>>]<-------------------------------------------------------------------------------------------------->>+>+<<<[[-]>>-<<]>>[>->>++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++.[-]<<<-]>[<<<<.>>>>-]<<<<,]"
+  },
+  {
+   "id": "L08-07",
+   "level": 8,
+   "level_name": "count and filter",
+   "description": "Read the whole input and print how many times the letter 'd' appears, as one digit.",
+   "tests": [
+    [
+     "",
+     "0"
+    ],
+    [
+     "d",
+     "1"
+    ],
+    [
+     "ddc",
+     "2"
+    ],
+    [
+     "cvdmdd",
+     "3"
+    ],
+    [
+     "cv",
+     "0"
+    ]
+   ],
+   "reference": ",[[->+>+<<]>>[-<<+>>]<---------------------------------------------------------------------------------------------------->>+>+<<<[[-]>>-<<]>>[>->+<<-]>[-]<<<<,]>>>>>++++++++++++++++++++++++++++++++++++++++++++++++."
+  },
+  {
+   "id": "L08-08",
+   "level": 8,
+   "level_name": "count and filter",
+   "description": "Read the whole input and print it with every 'g' removed.",
+   "tests": [
+    [
+     "bevbv",
+     "bevbv"
+    ],
+    [
+     "p",
+     "p"
+    ],
+    [
+     "ngwp",
+     "nwp"
+    ],
+    [
+     "glrg",
+     "lr"
+    ],
+    [
+     "dagrem",
+     "darem"
+    ]
+   ],
+   "reference": ",[[->+>+<<]>>[-<<+>>]<------------------------------------------------------------------------------------------------------->>+>+<<<[[-]>>-<<]>>[>-<-]>[<<<<.>>>>-]<<<<,]"
+  },
+  {
+   "id": "L08-09",
+   "level": 8,
+   "level_name": "count and filter",
+   "description": "Read the whole input and print it with every 'h' replaced by '_'.",
+   "tests": [
+    [
+     "hhedmcv",
+     "__edmcv"
+    ],
+    [
+     "dtvhem",
+     "dtv_em"
+    ],
+    [
+     "nndkgr",
+     "nndkgr"
+    ],
+    [
+     "bwluh",
+     "bwlu_"
+    ],
+    [
+     "rg",
+     "rg"
+    ]
+   ],
+   "reference": ",[[->+>+<<]>>[-<<+>>]<-------------------------------------------------------------------------------------------------------->>+>+<<<[[-]>>-<<]>>[>->>+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++.[-]<<<-]>[<<<<.>>>>-]<<<<,]"
+  },
+  {
+   "id": "L08-10",
+   "level": 8,
+   "level_name": "count and filter",
+   "description": "Read the whole input and print only its 'v' characters.",
+   "tests": [
+    [
+     "rvvrv",
+     "vvv"
+    ],
+    [
+     "hlvrvp",
+     "vv"
+    ],
+    [
+     "vr",
+     "v"
+    ],
+    [
+     "vm",
+     "v"
+    ],
+    [
+     "",
+     ""
+    ]
+   ],
+   "reference": ",[[->+>+<<]>>[-<<+>>]<---------------------------------------------------------------------------------------------------------------------->>+>+<<<[[-]>>-<<]>>[>-<<<<.>>>-]>[-]<<<<,]"
+  },
+  {
+   "id": "L09-01",
+   "level": 9,
+   "level_name": "multi-digit numbers",
+   "description": "Read a two-digit number n and print n + 1 in decimal.",
+   "tests": [
+    [
+     "43",
+     "44"
+    ],
+    [
+     "67",
+     "68"
+    ],
+    [
+     "45",
+     "46"
+    ],
+    [
+     "13",
+     "14"
+    ],
+    [
+     "69",
+     "70"
+    ]
+   ],
+   "reference": ",------------------------------------------------[->>>>>>>>>>++++++++++<<<<<<<<<<]>,------------------------------------------------[->>>>>>>>>+<<<<<<<<<]>>>>>>>>>+>++++++++++<[->-[>+>>]>[+[-<+>]>+>>]<<<<<]>>>[++++++++++++++++++++++++++++++++++++++++++++++++.[-]]<++++++++++++++++++++++++++++++++++++++++++++++++.[-]<[-]"
+  },
+  {
+   "id": "L09-02",
+   "level": 9,
+   "level_name": "multi-digit numbers",
+   "description": "Read a two-digit number n and print n + 7 in decimal.",
+   "tests": [
+    [
+     "52",
+     "59"
+    ],
+    [
+     "23",
+     "30"
+    ],
+    [
+     "28",
+     "35"
+    ],
+    [
+     "70",
+     "77"
+    ],
+    [
+     "78",
+     "85"
+    ]
+   ],
+   "reference": ",------------------------------------------------[->>>>>>>>>>++++++++++<<<<<<<<<<]>,------------------------------------------------[->>>>>>>>>+<<<<<<<<<]>>>>>>>>>+++++++>++++++++++<[->-[>+>>]>[+[-<+>]>+>>]<<<<<]>>>[++++++++++++++++++++++++++++++++++++++++++++++++.[-]]<++++++++++++++++++++++++++++++++++++++++++++++++.[-]<[-]"
+  },
+  {
+   "id": "L09-03",
+   "level": 9,
+   "level_name": "multi-digit numbers",
+   "description": "Read a two-digit number n and print n + 10 in decimal.",
+   "tests": [
+    [
+     "62",
+     "72"
+    ],
+    [
+     "58",
+     "68"
+    ],
+    [
+     "63",
+     "73"
+    ],
+    [
+     "44",
+     "54"
+    ],
+    [
+     "39",
+     "49"
+    ]
+   ],
+   "reference": ",------------------------------------------------[->>>>>>>>>>++++++++++<<<<<<<<<<]>,------------------------------------------------[->>>>>>>>>+<<<<<<<<<]>>>>>>>>>++++++++++>++++++++++<[->-[>+>>]>[+[-<+>]>+>>]<<<<<]>>>[++++++++++++++++++++++++++++++++++++++++++++++++.[-]]<++++++++++++++++++++++++++++++++++++++++++++++++.[-]<[-]"
+  },
+  {
+   "id": "L09-04",
+   "level": 9,
+   "level_name": "multi-digit numbers",
+   "description": "Read a two-digit number and print the sum of its two digits in decimal.",
+   "tests": [
+    [
+     "37",
+     "10"
+    ],
+    [
+     "94",
+     "13"
+    ],
+    [
+     "41",
+     "5"
+    ],
+    [
+     "99",
+     "18"
+    ],
+    [
+     "67",
+     "13"
+    ]
+   ],
+   "reference": ",------------------------------------------------[->>>>>>>>>>+<<<<<<<<<<]>,------------------------------------------------[->>>>>>>>>+<<<<<<<<<]>>>>>>>>>>++++++++++<[->-[>+>>]>[+[-<+>]>+>>]<<<<<]>>>[++++++++++++++++++++++++++++++++++++++++++++++++.[-]]<++++++++++++++++++++++++++++++++++++++++++++++++.[-]<[-]"
+  },
+  {
+   "id": "L09-05",
+   "level": 9,
+   "level_name": "multi-digit numbers",
+   "description": "Read a two-digit number n (at least 20) and print n - 13 in decimal.",
+   "tests": [
+    [
+     "53",
+     "40"
+    ],
+    [
+     "66",
+     "53"
+    ],
+    [
+     "69",
+     "56"
+    ],
+    [
+     "32",
+     "19"
+    ],
+    [
+     "50",
+     "37"
+    ]
+   ],
+   "reference": ",------------------------------------------------[->>>>>>>>>>++++++++++<<<<<<<<<<]>,------------------------------------------------[->>>>>>>>>+<<<<<<<<<]>>>>>>>>>------------->++++++++++<[->-[>+>>]>[+[-<+>]>+>>]<<<<<]>>>[++++++++++++++++++++++++++++++++++++++++++++++++.[-]]<++++++++++++++++++++++++++++++++++++++++++++++++.[-]<[-]"
+  },
+  {
+   "id": "L09-06",
+   "level": 9,
+   "level_name": "multi-digit numbers",
+   "description": "Read one digit and print twice its value in decimal.",
+   "tests": [
+    [
+     "4",
+     "8"
+    ],
+    [
+     "0",
+     "0"
+    ],
+    [
+     "7",
+     "14"
+    ],
+    [
+     "9",
+     "18"
+    ],
+    [
+     "5",
+     "10"
+    ]
+   ],
+   "reference": ",------------------------------------------------[->>>>>>>>>>++<<<<<<<<<<]>>>>>>>>>>>++++++++++<[->-[>+>>]>[+[-<+>]>+>>]<<<<<]>>>[++++++++++++++++++++++++++++++++++++++++++++++++.[-]]<++++++++++++++++++++++++++++++++++++++++++++++++.[-]<[-]"
+  },
+  {
+   "id": "L09-07",
+   "level": 9,
+   "level_name": "multi-digit numbers",
+   "description": "Read two digits separated by a space and print their product in decimal.",
+   "tests": [
+    [
+     "2 2",
+     "4"
+    ],
+    [
+     "2 1",
+     "2"
+    ],
+    [
+     "3 6",
+     "18"
+    ],
+    [
+     "4 0",
+     "0"
+    ],
+    [
+     "1 0",
+     "0"
+    ]
+   ],
+   "reference": ",------------------------------------------------>,>,------------------------------------------------<<[->>[->>>>>>>>+<<<<<<<+<]>[-<+>]<<<]>>>>>>>>>>>++++++++++<[->-[>+>>]>[+[-<+>]>+>>]<<<<<]>>>[++++++++++++++++++++++++++++++++++++++++++++++++.[-]]<++++++++++++++++++++++++++++++++++++++++++++++++.[-]<[-]"
+  },
+  {
+   "id": "L09-08",
+   "level": 9,
+   "level_name": "multi-digit numbers",
+   "description": "Read two digits separated by a space and print their product plus 1 in decimal.",
+   "tests": [
+    [
+     "3 3",
+     "10"
+    ],
+    [
+     "6 4",
+     "25"
+    ],
+    [
+     "4 5",
+     "21"
+    ],
+    [
+     "0 4",
+     "1"
+    ],
+    [
+     "9 4",
+     "37"
+    ]
+   ],
+   "reference": ",------------------------------------------------>,>,------------------------------------------------<<[->>[->>>>>>>>+<<<<<<<+<]>[-<+>]<<<]>>>>>>>>>>+>++++++++++<[->-[>+>>]>[+[-<+>]>+>>]<<<<<]>>>[++++++++++++++++++++++++++++++++++++++++++++++++.[-]]<++++++++++++++++++++++++++++++++++++++++++++++++.[-]<[-]"
+  },
+  {
+   "id": "L09-09",
+   "level": 9,
+   "level_name": "multi-digit numbers",
+   "description": "Read two digits separated by a space and print their sum in decimal.",
+   "tests": [
+    [
+     "1 5",
+     "6"
+    ],
+    [
+     "5 2",
+     "7"
+    ],
+    [
+     "3 3",
+     "6"
+    ],
+    [
+     "7 8",
+     "15"
+    ],
+    [
+     "3 4",
+     "7"
+    ]
+   ],
+   "reference": ",------------------------------------------------>,>,------------------------------------------------<<[->>>>>>>>>>+<<<<<<<<<<]>>[->>>>>>>>+<<<<<<<<]>>>>>>>>>++++++++++<[->-[>+>>]>[+[-<+>]>+>>]<<<<<]>>>[++++++++++++++++++++++++++++++++++++++++++++++++.[-]]<++++++++++++++++++++++++++++++++++++++++++++++++.[-]<[-]"
+  },
+  {
+   "id": "L09-10",
+   "level": 9,
+   "level_name": "multi-digit numbers",
+   "description": "Read one digit and print its square in decimal.",
+   "tests": [
+    [
+     "6",
+     "36"
+    ],
+    [
+     "1",
+     "1"
+    ],
+    [
+     "9",
+     "81"
+    ],
+    [
+     "8",
+     "64"
+    ],
+    [
+     "4",
+     "16"
+    ]
+   ],
+   "reference": ",------------------------------------------------[->>+>+<<<]>>>[-<<<+>>>]<<<[->>[->>>>>>>>+<<<<<<<+<]>[-<+>]<<<]>>>>>>>>>>>++++++++++<[->-[>+>>]>[+[-<+>]>+>>]<<<<<]>>>[++++++++++++++++++++++++++++++++++++++++++++++++.[-]]<++++++++++++++++++++++++++++++++++++++++++++++++.[-]<[-]"
+  },
+  {
+   "id": "L10-01",
+   "level": 10,
+   "level_name": "comparisons",
+   "description": "Read two digits separated by a space and print the larger one.",
+   "tests": [
+    [
+     "5 9",
+     "9"
+    ],
+    [
+     "5 7",
+     "7"
+    ],
+    [
+     "4 7",
+     "7"
+    ],
+    [
+     "2 0",
+     "2"
+    ],
+    [
+     "7 4",
+     "7"
+    ]
+   ],
+   "reference": ",------------------------------------------------>,>,------------------------------------------------<<[->>>>+>>+<<<<<<]>>>>>>[-<<<<<<+>>>>>>]<<<<[->>>+>+<<<<]>>>>[-<<<<+>>>>]<<[->>>>+<<<[->>>-<<<[->>>>+<<<<]]>>>>[-<<<<+>>>>]<[-<+>]<<<<]>[-<<<<<+>>>>>]<<<<<++++++++++++++++++++++++++++++++++++++++++++++++."
+  },
+  {
+   "id": "L10-02",
+   "level": 10,
+   "level_name": "comparisons",
+   "description": "Read two digits separated by a space and print the smaller one.",
+   "tests": [
+    [
+     "4 7",
+     "4"
+    ],
+    [
+     "6 7",
+     "6"
+    ],
+    [
+     "3 8",
+     "3"
+    ],
+    [
+     "1 7",
+     "1"
+    ],
+    [
+     "0 7",
+     "0"
+    ]
+   ],
+   "reference": ",------------------------------------------------>,>,------------------------------------------------<<[->>>>+>>+<<<<<<]>>>>>>[-<<<<<<+>>>>>>]<<<<[->>>+>+<<<<]>>>>[-<<<<+>>>>]<<[->>>>+<<<[->>>-<<<[->>>>+<<<<]]>>>>[-<<<<+>>>>]<[-<+>]<<<<]>>>[-<<<<<<<->>>>>>>]<<<<<<<++++++++++++++++++++++++++++++++++++++++++++++++."
+  },
+  {
+   "id": "L10-03",
+   "level": 10,
+   "level_name": "comparisons",
+   "description": "Read two digits separated by a space. Print '=' if they are equal, otherwise '!='.",
+   "tests": [
+    [
+     "6 9",
+     "!="
+    ],
+    [
+     "6 5",
+     "!="
+    ],
+    [
+     "9 9",
+     "="
+    ],
+    [
+     "6 6",
+     "="
+    ],
+    [
+     "3 2",
+     "!="
+    ]
+   ],
+   "reference": ",------------------------------------------------>,>,------------------------------------------------<<[->>>>+>>+<<<<<<]>>>>>>[-<<<<<<+>>>>>>]<<<<[->>>+>+<<<<]>>>>[-<<<<+>>>>]<<[->>>>+<<<[->>>-<<<[->>>>+<<<<]]>>>>[-<<<<+>>>>]<[-<+>]<<<<]>>>>>>+<<<[[-]>>>->+++++++++++++++++++++++++++++++++.++++++++++++++++++++++++++++.[-]<<<<]<<[[-]>>>>>->+++++++++++++++++++++++++++++++++.++++++++++++++++++++++++++++.[-]<<<<<<]>>>>>[->+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++.[-]<]"
+  },
+  {
+   "id": "L10-04",
+   "level": 10,
+   "level_name": "comparisons",
+   "description": "Read two digits a and b separated by a space. Print '>' if a > b, '<' if a < b, '=' if equal.",
+   "tests": [
+    [
+     "8 4",
+     ">"
+    ],
+    [
+     "4 4",
+     "="
+    ],
+    [
+     "5 5",
+     "="
+    ],
+    [
+     "5 4",
+     ">"
+    ],
+    [
+     "4 1",
+     ">"
+    ]
+   ],
+   "reference": ",------------------------------------------------>,>,------------------------------------------------<<[->>>>+>>+<<<<<<]>>>>>>[-<<<<<<+>>>>>>]<<<<[->>>+>+<<<<]>>>>[-<<<<+>>>>]<<[->>>>+<<<[->>>-<<<[->>>>+<<<<]]>>>>[-<<<<+>>>>]<[-<+>]<<<<]>>>>>>+<<<[[-]>>>->++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++.[-]<<<<]<<[[-]>>>>>->++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++.[-]<<<<<<]>>>>>[->+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++.[-]<]"
+  },
+  {
+   "id": "L10-05",
+   "level": 10,
+   "level_name": "comparisons",
+   "description": "Read two different digits separated by a space. Print 'first' if the first is larger, otherwise 'second'.",
+   "tests": [
+    [
+     "1 9",
+     "second"
+    ],
+    [
+     "1 3",
+     "second"
+    ],
+    [
+     "0 7",
+     "second"
+    ],
+    [
+     "5 6",
+     "second"
+    ],
+    [
+     "5 3",
+     "first"
+    ]
+   ],
+   "reference": ",------------------------------------------------>,>,------------------------------------------------<<[->>>>+>>+<<<<<<]>>>>>>[-<<<<<<+>>>>>>]<<<<[->>>+>+<<<<]>>>>[-<<<<+>>>>]<<[->>>>+<<<[->>>-<<<[->>>>+<<<<]]>>>>[-<<<<+>>>>]<[-<+>]<<<<]>>>>>>+<<<[[-]>>>->++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++.+++.+++++++++.+.+.[-]<<<<]<<[[-]>>>>>->+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++.--------------.--.++++++++++++.-.----------.[-]<<<<<<]>>>>>[->[-]<]"
+  },
+  {
+   "id": "L10-06",
+   "level": 10,
+   "level_name": "comparisons",
+   "description": "Read two digits separated by a space and print the larger one followed by the smaller one.",
+   "tests": [
+    [
+     "3 3",
+     "33"
+    ],
+    [
+     "8 9",
+     "98"
+    ],
+    [
+     "0 5",
+     "50"
+    ],
+    [
+     "0 3",
+     "30"
+    ],
+    [
+     "8 5",
+     "85"
+    ]
+   ],
+   "reference": ",------------------------------------------------>,>,------------------------------------------------<<[->>>>>>>>>>>>+<<<<<<+<<<<<<]>>>>>>[-<<<<<<+>>>>>>]<<<<<<[->>>>+>>+<<<<<<]>>>>>>[-<<<<<<+>>>>>>]<<<<[->>>+>+<<<<]>>>>[-<<<<+>>>>]<<[->>>>+<<<[->>>-<<<[->>>>+<<<<]]>>>>[-<<<<+>>>>]<[-<+>]<<<<]>[->>>>>>>+<<<<<<<]>>[-<<<<<<<->>>>>>>]>>>>>++++++++++++++++++++++++++++++++++++++++++++++++.<<<<<<<<<<<<++++++++++++++++++++++++++++++++++++++++++++++++."
+  },
+  {
+   "id": "L10-07",
+   "level": 10,
+   "level_name": "comparisons",
+   "description": "Read two digits separated by a space and print the absolute difference.",
+   "tests": [
+    [
+     "4 4",
+     "0"
+    ],
+    [
+     "3 0",
+     "3"
+    ],
+    [
+     "5 8",
+     "3"
+    ],
+    [
+     "7 0",
+     "7"
+    ],
+    [
+     "0 3",
+     "3"
+    ]
+   ],
+   "reference": ",------------------------------------------------>,>,------------------------------------------------<<[->>>>+>>+<<<<<<]>>>>>>[-<<<<<<+>>>>>>]<<<<[->>>+>+<<<<]>>>>[-<<<<+>>>>]<<[->>>>+<<<[->>>-<<<[->>>>+<<<<]]>>>>[-<<<<+>>>>]<[-<+>]<<<<]>>>[->>>>>+<<<<<]<<[->>>>>>>+<<<<<<<]>>>>>>>++++++++++++++++++++++++++++++++++++++++++++++++."
+  },
+  {
+   "id": "L10-08",
+   "level": 10,
+   "level_name": "comparisons",
+   "description": "Read two digits a and b separated by a space. Print 'yes' if a >= b, otherwise 'no'.",
+   "tests": [
+    [
+     "4 4",
+     "yes"
+    ],
+    [
+     "7 4",
+     "yes"
+    ],
+    [
+     "3 3",
+     "yes"
+    ],
+    [
+     "6 7",
+     "no"
+    ],
+    [
+     "8 1",
+     "yes"
+    ]
+   ],
+   "reference": ",------------------------------------------------>,>,------------------------------------------------<<[->>>>+>>+<<<<<<]>>>>>>[-<<<<<<+>>>>>>]<<<<[->>>+>+<<<<]>>>>[-<<<<+>>>>]<<[->>>>+<<<[->>>-<<<[->>>>+<<<<]]>>>>[-<<<<+>>>>]<[-<+>]<<<<]>>>>>>+<<<[[-]>>>->+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++.--------------------.++++++++++++++.[-]<<<<]<<[[-]>>>>>->++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++.+.[-]<<<<<<]>>>>>[->+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++.--------------------.++++++++++++++.[-]<]"
+  },
+  {
+   "id": "L10-09",
+   "level": 10,
+   "level_name": "comparisons",
+   "description": "Read two digits separated by a space. Print 'Y' if they are equal, otherwise 'N'.",
+   "tests": [
+    [
+     "3 2",
+     "N"
+    ],
+    [
+     "0 0",
+     "Y"
+    ],
+    [
+     "5 4",
+     "N"
+    ],
+    [
+     "8 2",
+     "N"
+    ],
+    [
+     "5 0",
+     "N"
+    ]
+   ],
+   "reference": ",------------------------------------------------>,>,------------------------------------------------<<[->>>>+>>+<<<<<<]>>>>>>[-<<<<<<+>>>>>>]<<<<[->>>+>+<<<<]>>>>[-<<<<+>>>>]<<[->>>>+<<<[->>>-<<<[->>>>+<<<<]]>>>>[-<<<<+>>>>]<[-<+>]<<<<]>>>>>>+<<<[[-]>>>->++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++.[-]<<<<]<<[[-]>>>>>->++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++.[-]<<<<<<]>>>>>[->+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++.[-]<]"
+  },
+  {
+   "id": "L10-10",
+   "level": 10,
+   "level_name": "comparisons",
+   "description": "Read two digits separated by a space and print the smaller, then 'x', then the larger.",
+   "tests": [
+    [
+     "9 4",
+     "4x9"
+    ],
+    [
+     "8 1",
+     "1x8"
+    ],
+    [
+     "0 8",
+     "0x8"
+    ],
+    [
+     "9 7",
+     "7x9"
+    ],
+    [
+     "5 6",
+     "5x6"
+    ]
+   ],
+   "reference": ",------------------------------------------------>,>,------------------------------------------------<<[->>>>>>>>>>>>+<<<<<<+<<<<<<]>>>>>>[-<<<<<<+>>>>>>]<<<<<<[->>>>+>>+<<<<<<]>>>>>>[-<<<<<<+>>>>>>]<<<<[->>>+>+<<<<]>>>>[-<<<<+>>>>]<<[->>>>+<<<[->>>-<<<[->>>>+<<<<]]>>>>[-<<<<+>>>>]<[-<+>]<<<<]>[->>>>>>>+<<<<<<<]>>[-<<<<<<<->>>>>>>]<<<<<<<++++++++++++++++++++++++++++++++++++++++++++++++.>>>>>>>>>>>++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++.[-]>++++++++++++++++++++++++++++++++++++++++++++++++."
+  }
+ ]
+}''')
+BASE_ID = "Qwen/Qwen2.5-Coder-1.5B-Instruct"
+MODELS = [   # (label, adapter or None for the plain base model)
+    ("base Qwen 1.5B", None),
+    ("v7.1", "hd2514p/bf-qwen-1.5b-sft-v71-ascii"),
+    ("v8 final", "hd2514p/bf-qwen-1.5b-grpo-v8b"),
+]
+MAX_NEW = 900
+BATCH = 8
+OUT = "/kaggle/working/bf_ladder_results.jsonl"
+STRICT = BFConfig(wrap_pointer=False, max_steps=500_000)
+BF = set("><+-.,[]")
+
+
+def extract_code(text):
+    if "\nCODE\n" in text:
+        return text.rsplit("\nCODE\n", 1)[-1].strip()
+    fence = re.search(r"```(?:\w+)?\n(.*?)```", text, re.S)
+    if fence:
+        return fence.group(1).strip()
+    return text.strip()
+
+
+def solved(code, tests):
+    for inp, out in tests:
+        r = run_bf(code, stdin=inp.encode("latin-1"), config=STRICT)
+        if r.error or r.output != out.encode("latin-1"):
+            return False
+    return True
+
+
+# the references must pass the frozen tests here too, or the grader itself is off
+bad = [p["id"] for p in LADDER["problems"] if not solved(p["reference"], p["tests"])]
+assert not bad, f"reference solutions fail on this machine: {bad}"
+print(f"BF-Ladder v{LADDER['version']}: {len(LADDER['problems'])} problems, references OK", flush=True)
+
+tokenizer = AutoTokenizer.from_pretrained(BASE_ID)
+tokenizer.padding_side = "left"
+base = AutoModelForCausalLM.from_pretrained(BASE_ID, dtype=torch.float16, device_map={"": 0})
+model = base
+adapters = [a for _, a in MODELS if a]
+for i, repo in enumerate(adapters):
+    if i == 0:
+        model = PeftModel.from_pretrained(base, repo, adapter_name=f"a{i}")
+    else:
+        model.load_adapter(repo, adapter_name=f"a{i}")
+model.eval()
+
+problems = sorted(LADDER["problems"], key=lambda p: len(p["description"]))
+LEVEL_NAMES = {p["level"]: p["level_name"] for p in LADDER["problems"]}
+scores = collections.defaultdict(lambda: [0, 0])   # (model, level) -> [solved, total]
+open(OUT, "w").close()
+t0, done, total = time.time(), 0, len(problems) * len(MODELS)
+COLORS = ["#9CA3AF", "#0D9488", "#7C3AED", "#D97706"]
+
+
+def show():
+    clear_output(wait=True)
+    levels = sorted(LEVEL_NAMES)
+    fig, ax = plt.subplots(figsize=(13, 4))
+    w = 0.8 / len(MODELS)
+    for mi, (label, _) in enumerate(MODELS):
+        vals = [scores[(label, l)][0] / 10 for l in levels]
+        ax.bar([x + mi * w for x in range(len(levels))], vals, w, color=COLORS[mi % 4],
+               label=f"{label} ({sum(scores[(label, l)][0] for l in levels)}/100)")
+    ax.set_xticks([x + w * (len(MODELS) - 1) / 2 for x in range(len(levels))],
+                  [f"{l}. {LEVEL_NAMES[l]}" for l in levels], rotation=30, ha="right", fontsize=8)
+    ax.set_ylim(0, 1); ax.set_ylabel("solved (of 10)"); ax.set_title("BF-Ladder v1")
+    ax.axvline(5.5, color="black", ls="--", lw=0.8)
+    ax.text(5.6, 0.93, "never trained ->", fontsize=8)
+    ax.grid(alpha=0.25, lw=0.6); ax.legend(fontsize=8, loc="upper right")
+    plt.tight_layout(); plt.show()
+    eta = (time.time() - t0) / max(done, 1) * (total - done)
+    print(f"{done}/{total} answers  elapsed {(time.time() - t0) / 60:.0f}m  eta {eta / 60:.0f}m",
+          flush=True)
+
+
+for label, repo in MODELS:
+    if repo is None:
+        ctx = model.disable_adapter() if isinstance(model, PeftModel) else torch.no_grad()
+    else:
+        model.set_adapter(f"a{adapters.index(repo)}")
+        ctx = torch.no_grad()
+    with ctx, torch.no_grad():
+        for b in range(0, len(problems), BATCH):
+            batch = problems[b:b + BATCH]
+            texts = [tokenizer.apply_chat_template(
+                [{"role": "user", "content": LADDER["prompt"].format(description=p["description"])}],
+                add_generation_prompt=True, tokenize=False) for p in batch]
+            enc = tokenizer(texts, return_tensors="pt", padding=True).to(model.device)
+            out = model.generate(**enc, max_new_tokens=MAX_NEW, do_sample=False,
+                                 pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id)
+            with open(OUT, "a", encoding="utf-8") as f:
+                for p, seq in zip(batch, out):
+                    raw = tokenizer.decode(seq[enc["input_ids"].shape[1]:], skip_special_tokens=True)
+                    code = extract_code(raw)
+                    ok = solved(code, p["tests"])
+                    scores[(label, p["level"])][0] += ok
+                    scores[(label, p["level"])][1] += 1
+                    f.write(json.dumps({"model": label, "id": p["id"], "level": p["level"],
+                                        "ok": ok, "code": code[:2000], "raw": raw}) + "\n")
+            done += len(batch)
+            show()
+
+show()
+print("\n=== BF-Ladder v1 results (solved of 10 per level) ===")
+header = f"{'level':28}" + "".join(f"{label:>18}" for label, _ in MODELS)
+print(header)
+for l in sorted(LEVEL_NAMES):
+    print(f"{str(l) + '. ' + LEVEL_NAMES[l]:28}" +
+          "".join(f"{scores[(label, l)][0]:>18}" for label, _ in MODELS))
+print(f"{'TOTAL (of 100)':28}" +
+      "".join(f"{sum(scores[(label, l)][0] for l in LEVEL_NAMES):>18}" for label, _ in MODELS))
+print(f"\nall answers: {OUT}")
